@@ -1,11 +1,23 @@
-// png-squeeze: a lossless PNG compressor for make.fun's png-squeeze-01.
+// png-squeeze v2: a lossless PNG compressor for make.fun's png-squeeze-01.
 // Reads /input/<id>/image.png (1280x720 RGBA 8-bit), writes /output/<id>/image.png.
 // Method: pick the smallest colour form per image (palette / grey / RGB / RGBA, with tRNS
-// where it fits), pick each row's filter by a cheap heuristic, then compress the filtered
-// bytes with an original deflate: a hash-chain LZ77 matcher, a lazy parse to seed a cost
-// model, a shortest-path (optimal) parse, and dynamic Huffman blocks. A zlib level 9 stream
-// is kept as a fallback and the smaller of the two is written. Everything is deterministic:
-// no clock, no randomness, no environment-dependent choice, so two runs emit identical bytes.
+// where it fits), pick each row's filter — fixed, by a cheap heuristic, or by brute force
+// (each row's five filters weighed by zlib level 4 after the preceding 32 KiB) — then
+// compress the filtered bytes with an original deflate: a hash-chain LZ77 matcher that
+// keeps the longest match per distance range, a lazy parse to seed a cost model, and a
+// shortest-path (optimal) parse run three times with the cost model re-estimated from
+// the previous parse's tokens, in dynamic Huffman blocks. A zlib level 9 stream is kept
+// as a fallback and the smaller of the two is written. Everything is deterministic:
+// no clock, no randomness, no environment-dependent choice, so two runs emit identical
+// bytes.
+//
+// v2 vs v1 (practice set, kit scorer): 722,208 -> 744,445, all 8 exact, 54.5 s
+// for the set (wall 60 s), two fresh runs byte-identical. What changed:
+// brute-force filter selection, a deeper hash chain (1024/512 by size),
+// longest-match-per-distance-range candidates in the optimal parse, and three
+// cost-model passes instead of one — the re-estimated model fixes the first
+// model's bias toward long far matches, which is also what made the i007 alpha
+// image lose to zlib level 9 in v1.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -370,7 +382,7 @@ function formsOf(rgba) {
   if (colours !== null) {
     for (const [order, filters] of [
       ['count', [0]],
-      ['luminance', [0, 'minsum']],
+      ['luminance', [0, 'minsum', 'brute']],
     ]) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
@@ -388,7 +400,7 @@ function formsOf(rgba) {
     if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
   }
   const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
-  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 1, 2, 4, 'minsum', 'pairs'] });
+  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 1, 2, 4, 'minsum', 'pairs', 'brute'] });
   return forms;
 }
 
@@ -409,8 +421,10 @@ function pairsOf(row, seen, stamp) {
 
 // The raw data of an image of `samples` (height rows of width x bpp samples), each row
 // behind its filter byte, by `choice`: a filter type (0 to 4) for every row, or 'minsum'
-// (each row the type whose filtered bytes have the least signed sum) or 'pairs' (each row
-// the type with the fewest distinct neighbouring byte pairs); the lower type on a tie.
+// (each row the type whose filtered bytes have the least signed sum), 'pairs' (each row
+// the type with the fewest distinct neighbouring byte pairs), or 'brute' (each row the
+// type whose filtered row, filter byte included, compresses smallest by zlib level 4
+// after the 32 KiB written before it); the lower type on a tie.
 function filtered(samples, width, height, bpp, choice) {
   const stride = width * bpp;
   const raw = new Uint8Array(height * (stride + 1));
@@ -432,7 +446,14 @@ function filtered(samples, width, height, bpp, choice) {
       filterRow(t, cur, prev, bpp, trial[t]);
       let cost;
       if (choice === 'minsum') cost = signedSum(trial[t]);
-      else cost = pairsOf(trial[t], seen, ++stamp);
+      else if (choice === 'pairs') cost = pairsOf(trial[t], seen, ++stamp);
+      else {
+        const before = raw.subarray(Math.max(0, at - 32768), at);
+        const row = new Uint8Array(stride + 1);
+        row[0] = t;
+        row.set(trial[t], 1);
+        cost = deflateSync(row, before.length === 0 ? { level: 4, memLevel: 9 } : { level: 4, memLevel: 9, dictionary: before }).length;
+      }
       if (cost < best) {
         best = cost;
         type = t;
@@ -682,8 +703,17 @@ function hash3(d, pos) {
   return (Math.imul(v, 2654435761) >>> (32 - HASH_BITS)) & HASH_MASK;
 }
 
+// Distance-range bucket of a match distance: 0:<32, 1:<256, 2:<2048, 3:<16384, 4:>=16384.
+function bucketOf(dist) {
+  return dist < 32 ? 0 : dist < 256 ? 1 : dist < 2048 ? 2 : dist < 16384 ? 3 : 4;
+}
+
 // The longest match and the closest match (smallest distance with length >= 3) at
-// every position of `data`, from a 3-byte hash chain over the previous 32 KiB.
+// every position of `data`, from a 3-byte hash chain over the previous 32 KiB —
+// plus, per position, the longest match in each of five distance ranges, so the
+// parse can trade a slightly shorter match for a much cheaper distance. The length
+// count starts at 0, not 3: a hash collision can put two different three-byte
+// sequences in one chain, so the first three bytes must be compared like the rest.
 function findMatches(data, maxChain) {
   const N = data.length;
   const head = new Int32Array(HASH_SIZE).fill(-1);
@@ -692,6 +722,8 @@ function findMatches(data, maxChain) {
   const mDist = new Uint16Array(N);
   const cLen = new Uint16Array(N);
   const cDist = new Uint16Array(N);
+  const bLen = new Uint16Array(5 * N);
+  const bDist = new Uint16Array(5 * N);
   const limit = N - MIN_MATCH;
   for (let pos = 0; pos <= limit; pos++) {
     const h = hash3(data, pos);
@@ -703,7 +735,7 @@ function findMatches(data, maxChain) {
     let closeDist = 0;
     let chain = 0;
     const earliest = pos - WINDOW;
-    while (cur > earliest && chain < maxChain) {
+    while (cur >= 0 && cur > earliest && chain < maxChain) {
       chain++;
       if (bestLen > 0 && data[cur + bestLen] !== data[pos + bestLen]) {
         cur = prev[cur];
@@ -722,6 +754,11 @@ function findMatches(data, maxChain) {
           closeLen = len;
           closeDist = dist;
         }
+        const b = bucketOf(dist);
+        if (len > bLen[b * N + pos]) {
+          bLen[b * N + pos] = len;
+          bDist[b * N + pos] = dist;
+        }
       }
       cur = prev[cur];
     }
@@ -732,7 +769,7 @@ function findMatches(data, maxChain) {
     prev[pos] = head[h];
     head[h] = pos;
   }
-  return { mLen, mDist, cLen, cDist };
+  return { mLen, mDist, cLen, cDist, bLen, bDist };
 }
 
 // A lazy parse: at each position, take the match unless the next position has a
@@ -826,12 +863,24 @@ function costModelFromTokens(tokens) {
 }
 
 // The shortest-path parse: at each position, the cheapest of one literal, the
-// longest match, or the closest match, under the cost model. Reconstructs tokens
-// by walking back from the end.
+// longest match, the closest match, or the longest match in each distance range,
+// under the cost model. Reconstructs tokens by walking back from the end.
 function dpParse(data, cand, model) {
   const N = data.length;
-  const { mLen, mDist, cLen, cDist } = cand;
+  const { mLen, mDist, cLen, cDist, bLen, bDist } = cand;
   const { litCost, lenCostFull, distCostFull } = model;
+  // Cost of a match of each length and each distance, precomputed so the inner
+  // loop is array lookups instead of length/dist code searches.
+  const lenCostByLen = new Float64Array(259);
+  for (let len = 3; len <= 258; len++) {
+    const [lc] = lenCodeOf(len);
+    lenCostByLen[len] = lenCostFull[lc - 257];
+  }
+  const distCostByDist = new Float64Array(WINDOW + 1);
+  for (let dist = 1; dist <= WINDOW; dist++) {
+    const [dc] = distCodeOf(dist);
+    distCostByDist[dist] = distCostFull[dc];
+  }
   const cost = new Float64Array(N + 1).fill(Infinity);
   const back = new Int32Array(N + 1);
   const backLen = new Uint16Array(N + 1);
@@ -848,9 +897,7 @@ function dpParse(data, cand, model) {
     }
     const tryMatch = (len, dist) => {
       if (len < MIN_MATCH) return;
-      const [lc2] = lenCodeOf(len);
-      const [dc] = distCodeOf(dist);
-      const mc = ci + lenCostFull[lc2 - 257] + distCostFull[dc];
+      const mc = ci + lenCostByLen[len] + distCostByDist[dist];
       const j = i + len;
       if (mc < cost[j]) {
         cost[j] = mc;
@@ -861,6 +908,11 @@ function dpParse(data, cand, model) {
     };
     tryMatch(mLen[i], mDist[i]);
     if (cLen[i] >= MIN_MATCH && (cLen[i] !== mLen[i] || cDist[i] !== mDist[i])) tryMatch(cLen[i], cDist[i]);
+    for (let b = 0; b < 5; b++) {
+      const len = bLen[b * N + i];
+      const dist = bDist[b * N + i];
+      if (len >= MIN_MATCH && len !== mLen[i]) tryMatch(len, dist);
+    }
   }
   const rev = [];
   let p = N;
@@ -939,14 +991,21 @@ function encodeBlock(bw, tokens, start, end, isLast) {
   bw.write(litCodes[256], litLens[256]);
 }
 
-// The raw deflate stream of `data`: match, lazy-parse, build a cost model, optimal
-// parse, then encode in fixed-size blocks. `maxChain` caps the match search;
-// `blockBytes` caps each block's input span.
+// The raw deflate stream of `data`: match, lazy-parse, build a cost model, then run
+// the optimal parse three times, re-estimating the cost model from the previous
+// parse's tokens each time — the parse converges by the third pass (a fourth and
+// fifth pass write identical bytes), and the re-estimated model is what fixes the
+// first model's bias toward long far matches. Then encode in fixed-size blocks.
+// `maxChain` caps the match search; `blockBytes` caps each block's input span.
 function deflateRaw(data, maxChain, blockBytes) {
   const cand = findMatches(data, maxChain);
   const lazy = lazyParse(data, cand);
-  const model = costModelFromTokens(lazy);
-  const tokens = dpParse(data, cand, model);
+  let model = costModelFromTokens(lazy);
+  let tokens = dpParse(data, cand, model);
+  for (let pass = 1; pass < 3; pass++) {
+    model = costModelFromTokens(tokens);
+    tokens = dpParse(data, cand, model);
+  }
   const bw = new BitWriter(Math.max(1024, data.length));
   let start = 0;
   let blockStartPos = 0;
@@ -978,11 +1037,15 @@ function zlibWrap(deflated, raw) {
   return out;
 }
 
-// The match search depth by filtered size: small images are quick and earn the most
-// points per byte saved, so they get a deeper search; large images get a shallower
-// one to stay inside the 60-second wall for all eight.
+// The match search depth by filtered size: 1024 for the smaller streams, 512 for
+// the larger ones. A 1024 chain everywhere costs ~75 s on this machine — past the
+// 60 s wall, which earns nothing — while 512 on the large streams costs only
+// ~3,900 bytes over the eight images and buys the ~20 s the wall needs. (A 2048
+// chain buys ~500 bytes for nearly twice the matcher time; a chain cut once a
+// length-32 match is found costs up to 2,176 bytes at three cost-model passes;
+// 384 on the largest streams was tried and saved no measurable time.)
 function chainFor(dataLength) {
-  return dataLength <= 1500000 ? 512 : 128;
+  return dataLength <= 1500000 ? 1024 : 512;
 }
 
 // Compress `data` with the original deflate, and with zlib level 9 as a fallback;
@@ -1007,18 +1070,35 @@ function pngOfForm(width, height, form, idat) {
 
 // Pick an image's best (form, filter choice): each choice's filtered data weighed by
 // zlib level 6 plus its PLTE/tRNS chunk bytes, the smallest winning, the first on a tie.
+// Brute force is only tried for a form whose best so far is a heuristic (minsum or
+// pairs): measured over the practice set, brute force never beats a fixed filter,
+// and only wins where a heuristic won — so skipping it elsewhere saves seconds at
+// no cost in bytes.
 function screen(rgba, width, height) {
   let best = null;
   for (const form of formsOf(rgba)) {
     const size = height * (width * form.bpp + 1);
     const chunks = chunkBytes(form);
+    let formBest = null;
     for (const choice of form.filters) {
+      if (choice === 'brute') continue;
       const data = filtered(form.samples, width, height, form.bpp, choice);
       const zlib = deflateSync(data, { level: 6, memLevel: 8 });
       const bytes = zlib.length + chunks;
-      if (best === null || bytes < best.bytes) {
-        best = { form, choice, data, bytes };
+      if (formBest === null || bytes < formBest.bytes) {
+        formBest = { form, choice, data, bytes };
       }
+    }
+    if (form.filters.includes('brute') && formBest !== null && (formBest.choice === 'minsum' || formBest.choice === 'pairs')) {
+      const data = filtered(form.samples, width, height, form.bpp, 'brute');
+      const zlib = deflateSync(data, { level: 6, memLevel: 8 });
+      const bytes = zlib.length + chunks;
+      if (bytes < formBest.bytes) {
+        formBest = { form, choice: 'brute', data, bytes };
+      }
+    }
+    if (formBest !== null && (best === null || formBest.bytes < best.bytes)) {
+      best = formBest;
     }
   }
   return best;
